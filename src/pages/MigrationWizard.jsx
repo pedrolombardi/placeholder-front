@@ -146,22 +146,27 @@ function Title({ icon, title, subtitle }) {
 }
 
 function SourceStep({ form, setForm }) {
-  const set = (k) => (e) => setForm({ ...form, source: { ...form.source, [k]: e.target.value } })
+  // MVP: a origem e a configurada no DB Layer (banco de demonstracao). Os campos
+  // ficam fixos para o usuario nao digitar um banco que sera recusado.
+  const locked = { readOnly: true, className: 'input--locked' }
   return (
     <div className="wizard-section">
       <Title icon="⌁" title="Banco de origem" subtitle="Somente leitura: a origem nunca é alterada." />
       <div className="form-card">
         <label>Nome da migração<input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></label>
         <div className="grid-3">
-          <label>Tipo de banco<select value={form.source.type} onChange={set('type')}><option value="mysql">MySQL</option></select></label>
-          <label>Host<input value={form.source.host} onChange={set('host')} /></label>
-          <label>Database<input value={form.source.database} onChange={set('database')} /></label>
+          <label>Tipo de banco<select value={form.source.type} disabled><option value="mysql">MySQL</option></select></label>
+          <label>Host<input value={form.source.host} {...locked} /></label>
+          <label>Database<input value={form.source.database} {...locked} /></label>
         </div>
         <div className="grid-2">
-          <label>Usuário (somente leitura)<input value={form.source.user} onChange={set('user')} /></label>
-          <label>Senha<input type="password" value={form.source.password} onChange={set('password')} /></label>
+          <label>Usuário (somente leitura)<input value={form.source.user} {...locked} /></label>
+          <label>Senha<input type="password" value={form.source.password} {...locked} /></label>
         </div>
-        <div className="notice notice--info">No MVP, o DB Layer usa a origem configurada nele (<strong>vendas</strong>) e recusa outro banco.</div>
+        <div className="notice notice--info">
+          MVP: a origem é o banco de demonstração configurado no DB Layer (MySQL <strong>vendas</strong>, usuário somente leitura),
+          com as cargas de conflito reais. Conectar em outro banco pela tela fica para a Fase 7.
+        </div>
       </div>
     </div>
   )

@@ -50,3 +50,4 @@ button:disabled{cursor:not-allowed;opacity:.55}
 .decision-card textarea { width: 100%; margin-top: 6px; font: inherit; padding: 8px; border-radius: 8px; border: 1px solid #d1d5db; }
 .event-list { list-style: none; padding: 0; margin: 8px 0; display: grid; gap: 6px; }
 .script-box { background: #0f172a; color: #e2e8f0; padding: 16px; border-radius: 10px; overflow-x: auto; font-size: 12px; line-height: 1.5; white-space: pre; }
+.input--locked { background: #f3f4f6; color: #6b7280; cursor: not-allowed; }
