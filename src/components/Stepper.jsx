@@ -1,4 +1,4 @@
-const labels = ['Origem', 'Destino', 'Análise', 'Mapeamento', 'Anonimização', 'Validação', 'Migração']
+const labels = ['Origem', 'Destino', 'Análise', 'Proposta', 'Homologação', 'Execução', 'Resultado']
 
 export default function Stepper({ current }) {
   return (

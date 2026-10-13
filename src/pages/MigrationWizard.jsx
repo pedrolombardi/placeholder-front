@@ -1,109 +1,344 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useState } from 'react'
 import Stepper from '../components/Stepper'
 import StatusBadge from '../components/StatusBadge'
+import { api, waitWhile } from '../api'
 
-const sensitiveRows = [
-  ['id','NUMBER','Não','—','—'],
-  ['nome','VARCHAR','Sim','98%','Substituição'],
-  ['email','VARCHAR','Sim','96%','Hash'],
-  ['cpf','VARCHAR','Sim','99%','Máscara'],
-  ['telefone','VARCHAR','Sim','95%','Máscara'],
-  ['data_nascimento','DATE','Sim','97%','Generalização'],
-  ['cidade','VARCHAR','Não','—','—'],
-]
+/**
+ * Fluxo real da plataforma, ligado ao Backend Core:
+ * origem/destino -> analise (DB Layer classifica, IA decide PROPOSE/DEFER) ->
+ * proposta -> homologacao humana -> execucao (sandbox anonimizado + validacao)
+ * -> resultado (verificacoes + script de migracao).
+ */
 
-const mappings = [
-  ['id','customer_id','94%'],
-  ['nome','name','92%'],
-  ['email','email','96%'],
-  ['cpf','document','98%'],
-  ['data_nascimento','birth_date','90%'],
-]
-
-const anonymization = [
-  ['nome','Sim','Substituição','Marcelo Tan','Cliente_4821'],
-  ['cpf','Sim','Máscara','123.456.789-10','***.***.789-**'],
-  ['email','Sim','Hash','marcelo@email.com','a91bc23...'],
-  ['telefone','Sim','Máscara','(11) 91234-5678','(**) *****-5678'],
-  ['cidade','Não','Nenhuma','São Paulo','São Paulo'],
-]
+const WHO = { rule: ['Regra', 'neutral'], ai: ['IA', 'info'], human: ['Humano', 'warning'] }
+const STATUS_TEXT = {
+  CREATED: 'Migração criada',
+  ANALYZING: 'Analisando: DB Layer lê os catálogos e classifica; a IA julga os conflitos ambíguos',
+  WAITING_APPROVAL: 'Aguardando homologação humana',
+  APPROVED: 'Aprovada',
+  EXECUTING: 'Gerando o sandbox: DB Layer extrai a amostra e o Data Layer anonimiza',
+  VALIDATING: 'Validando o plano no sandbox Oracle (5 verificações determinísticas)',
+  COMPLETED: 'Concluída: plano validado e script de migração gerado',
+  REJECTED: 'Rejeitada na homologação',
+  FAILED: 'Falhou',
+}
+const SUGGESTED = 'Converter para NULL e registrar no relatório (decisão do DBA)'
 
 export default function MigrationWizard() {
   const [step, setStep] = useState(1)
-  const [connectionTest, setConnectionTest] = useState(null)
-  const [progress, setProgress] = useState(0)
-  const [running, setRunning] = useState(false)
+  const [form, setForm] = useState({
+    name: 'Vendas MySQL → Oracle',
+    source: { type: 'mysql', host: 'mysql', database: 'vendas', user: 'readonly', password: 'readonly' },
+    target: { type: 'oracle' },
+  })
+  const [migration, setMigration] = useState(null)
+  const [events, setEvents] = useState([])
+  const [decisions, setDecisions] = useState({})
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState(null)
 
-  useEffect(() => {
-    if (!running) return
-    if (progress >= 100) { setRunning(false); return }
-    const id = setTimeout(() => setProgress(p => Math.min(100, p + 7)), 300)
-    return () => clearTimeout(id)
-  }, [running, progress])
+  const conflicts = migration?.proposal?.conflicts ?? []
+  const deferred = conflicts.filter((c) => c.status === 'DEFERRED')
 
-  const stageStatus = useMemo(() => {
-    if (progress < 20) return ['CLIENTES','Executando']
-    if (progress < 45) return ['PEDIDOS','Executando']
-    if (progress < 70) return ['PRODUTOS','Executando']
-    if (progress < 90) return ['ENDERECOS','Executando']
-    if (progress < 100) return ['PAGAMENTOS','Executando']
-    return ['Finalizado','Concluído']
-  }, [progress])
-
-  const testConnection = () => {
-    setConnectionTest('loading')
-    setTimeout(() => setConnectionTest('success'), 650)
+  const track = async (m) => {
+    setMigration(m)
+    setEvents(await api.events(m.id).catch(() => []))
   }
 
-  const next = () => setStep(s => Math.min(7, s + 1))
-  const back = () => setStep(s => Math.max(1, s - 1))
+  const guard = (fn) => async () => {
+    setBusy(true)
+    setError(null)
+    try {
+      await fn()
+    } catch (e) {
+      setError(e.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const analyze = guard(async () => {
+    const created = await api.createMigration(form)
+    await api.analyze(created.id)
+    const m = await waitWhile(created.id, ['CREATED', 'ANALYZING'], track)
+    await track(m)
+    if (m.status === 'FAILED') throw new Error(m.error ?? 'Análise falhou')
+    setDecisions(Object.fromEntries(m.proposal.conflicts.filter((c) => c.status === 'DEFERRED').map((c) => [c.id, SUGGESTED])))
+    setStep(3)
+  })
+
+  const approveAndExecute = guard(async () => {
+    const list = deferred.map((c) => ({ conflictId: c.id, resolution: decisions[c.id]?.trim() || SUGGESTED }))
+    await api.approve(migration.id, list)
+    await api.execute(migration.id)
+    setStep(6)
+    const m = await waitWhile(migration.id, ['APPROVED', 'EXECUTING', 'VALIDATING'], track)
+    await track(m)
+    setStep(7)
+  })
+
+  const reject = guard(async () => {
+    const m = await api.reject(migration.id, 'Rejeitada no assistente')
+    await track(m)
+    setStep(7)
+  })
+
+  const restart = () => {
+    setStep(1)
+    setMigration(null)
+    setEvents([])
+    setError(null)
+  }
 
   return (
     <div className="page migration-page">
-      <div className="page-heading"><div><span className="eyebrow">NOVO PROJETO</span><h1>Assistente de migração</h1><p>Configure a migração passo a passo e revise tudo antes de executar.</p></div><StatusBadge tone="info">Rascunho salvo</StatusBadge></div>
+      <div className="page-heading">
+        <div>
+          <span className="eyebrow">NOVA MIGRAÇÃO</span>
+          <h1>Assistente de migração</h1>
+          <p>Origem e destino reais: o código resolve o mecânico, a IA julga o ambíguo e você homologa.</p>
+        </div>
+        <StatusBadge tone={migration ? 'info' : 'neutral'}>{migration ? migration.status : 'Rascunho'}</StatusBadge>
+      </div>
       <section className="panel migration-shell">
         <Stepper current={step} />
         <div className="migration-body">
-          {step === 1 && <ConnectionStep title="Banco de origem" subtitle="Conecte-se ao banco de dados de origem." defaultDb="Oracle" defaultPort="1521" service="ORCL" connectionTest={connectionTest} onTest={testConnection} />}
-          {step === 2 && <ConnectionStep title="Banco de destino" subtitle="Defina para onde os dados serão migrados." defaultDb="PostgreSQL" defaultPort="5432" service="placeholder_prod" connectionTest={connectionTest} onTest={testConnection} />}
-          {step === 3 && <AnalysisStep />}
-          {step === 4 && <MappingStep />}
-          {step === 5 && <AnonymizationStep />}
-          {step === 6 && <ValidationStep />}
-          {step === 7 && <ExecutionStep progress={progress} running={running} setRunning={setRunning} stageStatus={stageStatus} />}
+          {error && <div className="notice notice--danger">✕ {error}</div>}
+          {step === 1 && <SourceStep form={form} setForm={setForm} />}
+          {step === 2 && <TargetStep form={form} setForm={setForm} busy={busy} />}
+          {step === 3 && <AnalysisStep migration={migration} />}
+          {step === 4 && <ProposalStep conflicts={conflicts} />}
+          {step === 5 && <ApprovalStep deferred={deferred} decisions={decisions} setDecisions={setDecisions} />}
+          {step === 6 && <ExecutionStep migration={migration} events={events} />}
+          {step === 7 && <ResultStep migration={migration} events={events} />}
         </div>
         <div className="wizard-footer">
-          <button className="btn btn--secondary" onClick={back} disabled={step === 1}>← Voltar</button>
-          {step < 7 ? <button className="btn btn--primary" onClick={() => { setConnectionTest(null); next() }}>Continuar →</button> : progress < 100 ? <button className="btn btn--primary" onClick={() => setRunning(true)} disabled={running}>{running ? 'Migrando...' : progress > 0 ? 'Continuar migração' : 'Iniciar migração'}</button> : <button className="btn btn--primary" onClick={() => { setStep(1); setProgress(0) }}>Nova migração</button>}
+          <button className="btn btn--secondary" onClick={() => setStep((s) => s - 1)} disabled={busy || step === 1 || step >= 5 || step === 3}>
+            ← Voltar
+          </button>
+          {step === 1 && <button className="btn btn--primary" onClick={() => setStep(2)}>Continuar →</button>}
+          {step === 2 && <button className="btn btn--primary" onClick={analyze} disabled={busy}>{busy ? 'Analisando...' : 'Analisar migração →'}</button>}
+          {(step === 3 || step === 4) && <button className="btn btn--primary" onClick={() => setStep(step + 1)}>Continuar →</button>}
+          {step === 5 && (
+            <span>
+              <button className="btn btn--secondary" onClick={reject} disabled={busy}>Rejeitar</button>{' '}
+              <button className="btn btn--primary" onClick={approveAndExecute} disabled={busy}>{busy ? 'Executando...' : 'Aprovar e executar →'}</button>
+            </span>
+          )}
+          {step === 6 && <button className="btn btn--primary" disabled>Executando...</button>}
+          {step === 7 && <button className="btn btn--primary" onClick={restart}>Nova migração</button>}
         </div>
       </section>
     </div>
   )
 }
 
-function ConnectionStep({ title, subtitle, defaultDb, defaultPort, service, connectionTest, onTest }) {
-  return <div className="wizard-section"><div className="wizard-title"><span className="wizard-icon">⌁</span><div><h2>{title}</h2><p>{subtitle}</p></div></div><div className="form-card"><label>Tipo de banco<select defaultValue={defaultDb}><option>Oracle</option><option>PostgreSQL</option><option>MySQL</option><option>SQL Server</option><option>MongoDB</option></select></label><div className="grid-3"><label>Host<input defaultValue="localhost"/></label><label>Porta<input defaultValue={defaultPort}/></label><label>Database / Service<input defaultValue={service}/></label></div><div className="grid-2"><label>Usuário<input defaultValue="admin"/></label><label>Senha<input type="password" defaultValue="password123"/></label></div><button className="btn btn--test" onClick={onTest} type="button">{connectionTest === 'loading' ? 'Testando...' : 'Testar conexão'}</button>{connectionTest === 'success' && <div className="notice notice--success">✓ Conexão realizada com sucesso.</div>}<div className="connection-note"><strong>Dica de segurança</strong><p>Em produção, as credenciais devem ser enviadas ao backend por HTTPS e armazenadas em um cofre de segredos, nunca no navegador.</p></div></div></div>
+function Title({ icon, title, subtitle }) {
+  return (
+    <div className="wizard-title">
+      <span className="wizard-icon">{icon}</span>
+      <div>
+        <h2>{title}</h2>
+        <p>{subtitle}</p>
+      </div>
+    </div>
+  )
 }
 
-function AnalysisStep() {
-  return <div className="wizard-section"><div className="wizard-title"><span className="wizard-icon">✦</span><div><h2>Análise do banco por IA</h2><p>A estrutura foi analisada e possíveis dados sensíveis foram identificados.</p></div></div><div className="analysis-metrics"><div><span>▦</span><strong>18</strong><small>Tabelas</small></div><div><span>⌗</span><strong>247</strong><small>Colunas</small></div><div><span>◉</span><strong>35.482</strong><small>Registros</small></div><div className="danger"><span>⚠</span><strong>12</strong><small>Campos sensíveis</small></div></div><div className="analysis-layout"><aside className="table-tabs"><strong>Tabelas</strong>{['CLIENTES','PEDIDOS','PRODUTOS','ENDERECOS','PAGAMENTOS'].map((t,i)=><button className={i===0?'active':''} key={t}>{t}</button>)}</aside><div className="analysis-table"><div className="panel__header"><div><h3>CLIENTES</h3><p>Sugestões da IA por coluna.</p></div><StatusBadge tone="info">IA analisada</StatusBadge></div><div className="table-wrap"><table><thead><tr><th>Coluna</th><th>Tipo</th><th>Sensível</th><th>Confiança</th><th>Sugestão</th></tr></thead><tbody>{sensitiveRows.map(r=><tr key={r[0]}><td><strong>{r[0]}</strong></td><td>{r[1]}</td><td><StatusBadge tone={r[2]==='Sim'?'danger':'success'}>{r[2]}</StatusBadge></td><td>{r[3]}</td><td>{r[4]}</td></tr>)}</tbody></table></div><div className="ai-suggestion"><div><span className="ai-badge">✦ IA</span><strong>Sugestão para CPF</strong><p>Classificação: dado pessoal identificável · Confiança: 99%</p></div><div className="ai-preview"><code>123.456.789-10</code><b>→</b><code>***.***.789-**</code></div><div className="ai-actions"><button className="btn btn--primary btn--sm">Aceitar sugestão</button><button className="btn btn--secondary btn--sm">Alterar</button><button className="btn btn--secondary btn--sm">Ignorar</button></div></div></div></div></div>
+function SourceStep({ form, setForm }) {
+  const set = (k) => (e) => setForm({ ...form, source: { ...form.source, [k]: e.target.value } })
+  return (
+    <div className="wizard-section">
+      <Title icon="⌁" title="Banco de origem" subtitle="Somente leitura: a origem nunca é alterada." />
+      <div className="form-card">
+        <label>Nome da migração<input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></label>
+        <div className="grid-3">
+          <label>Tipo de banco<select value={form.source.type} onChange={set('type')}><option value="mysql">MySQL</option></select></label>
+          <label>Host<input value={form.source.host} onChange={set('host')} /></label>
+          <label>Database<input value={form.source.database} onChange={set('database')} /></label>
+        </div>
+        <div className="grid-2">
+          <label>Usuário (somente leitura)<input value={form.source.user} onChange={set('user')} /></label>
+          <label>Senha<input type="password" value={form.source.password} onChange={set('password')} /></label>
+        </div>
+        <div className="notice notice--info">No MVP, o DB Layer usa a origem configurada nele (<strong>vendas</strong>) e recusa outro banco.</div>
+      </div>
+    </div>
+  )
 }
 
-function MappingStep(){
- return <div className="wizard-section"><div className="wizard-title"><span className="wizard-icon">⇄</span><div><h2>Mapeamento de tabelas e campos</h2><p>Revise as correspondências sugeridas entre origem e destino.</p></div></div><div className="mapping-head"><div><span>ORIGEM</span><strong>Oracle · CLIENTES</strong></div><div className="mapping-arrow">→</div><div><span>DESTINO</span><strong>PostgreSQL · CUSTOMERS</strong></div></div><div className="mapping-list">{mappings.map((m,i)=><div className="mapping-row" key={m[0]}><select defaultValue={m[0]}><option>{m[0]}</option></select><span>→</span><select defaultValue={m[1]}><option>{m[1]}</option><option>Ignorar campo</option></select><StatusBadge tone="info">IA {m[2]}</StatusBadge><button title="Editar">⚙</button></div>)}</div><div className="notice notice--info">✦ A IA sugeriu 42 correspondências automáticas. 39 possuem confiança acima de 90%.</div></div>
+function TargetStep({ form, setForm, busy }) {
+  return (
+    <div className="wizard-section">
+      <Title icon="⌁" title="Banco de destino" subtitle="Oracle Database 23ai. Nada é escrito no destino sem homologação." />
+      <div className="form-card">
+        <label>Tipo de banco<select value={form.target.type} onChange={(e) => setForm({ ...form, target: { type: e.target.value } })}><option value="oracle">Oracle</option></select></label>
+        <div className="notice notice--info">
+          {busy ? STATUS_TEXT.ANALYZING : 'Ao analisar, o DB Layer testa as conexões, lê os dois catálogos e classifica cada coluna; os conflitos de julgamento vão para a IA.'}
+        </div>
+      </div>
+    </div>
+  )
 }
 
-function AnonymizationStep(){
- return <div className="wizard-section"><div className="wizard-title"><span className="wizard-icon">🛡</span><div><h2>Regras de anonimização</h2><p>Defina como os dados sensíveis serão tratados antes de chegar ao destino.</p></div></div><div className="table-wrap anonymization-table"><table><thead><tr><th>Campo</th><th>Sensível</th><th>Técnica</th><th>Antes</th><th>Depois</th></tr></thead><tbody>{anonymization.map(r=><tr key={r[0]}><td><strong>{r[0]}</strong></td><td><StatusBadge tone={r[1]==='Sim'?'danger':'success'}>{r[1]}</StatusBadge></td><td><select defaultValue={r[2]}><option>Nenhuma</option><option>Máscara</option><option>Hash</option><option>Substituição</option><option>Remoção</option><option>Dados sintéticos</option><option>Generalização</option></select></td><td><code>{r[3]}</code></td><td><code>{r[4]}</code></td></tr>)}</tbody></table></div><div className="privacy-card"><span>🛡️</span><div><strong>Política de privacidade aplicada</strong><p>4 campos receberão transformação antes da escrita no banco de destino. O valor original não será exibido nos relatórios.</p></div></div></div>
+function AnalysisStep({ migration }) {
+  const p = migration.proposal
+  const count = (by) => p.conflicts.filter((c) => c.decidedBy === by).length
+  const columns = p.tables.reduce((n, t) => n + t.columns.length, 0)
+  const judgement = p.conflicts.filter((c) => c.kind === 'judgement')
+  return (
+    <div className="wizard-section">
+      <Title icon="✦" title="Análise" subtitle={p.summary} />
+      <div className="analysis-metrics">
+        <div><span>▦</span><strong>{p.tables.length}</strong><small>Tabelas</small></div>
+        <div><span>⌗</span><strong>{columns}</strong><small>Colunas</small></div>
+        <div><span>⚙</span><strong>{count('rule')}</strong><small>Resolvidas por regra</small></div>
+        <div><span>✦</span><strong>{count('ai')}</strong><small>Propostas pela IA</small></div>
+        <div className="danger"><span>⚠</span><strong>{p.pendingDecisions}</strong><small>Aguardando humano</small></div>
+      </div>
+      <h3>Conflitos de julgamento</h3>
+      <div className="table-wrap">
+        <table>
+          <thead><tr><th>Coluna</th><th>Origem → destino</th><th>Decisão</th><th>Proposta / motivo</th></tr></thead>
+          <tbody>
+            {judgement.map((c) => (
+              <tr key={c.id}>
+                <td><strong>{c.id}</strong></td>
+                <td>{c.sourceType} → {c.targetType}</td>
+                <td>{c.status === 'DEFERRED' ? <StatusBadge tone="danger">DEFER</StatusBadge> : <StatusBadge tone="info">PROPOSE</StatusBadge>}</td>
+                <td>
+                  {c.resolution ?? c.deferReason}
+                  {c.evidence?.length > 0 && <small className="evidence">Evidência: {c.evidence.join(' · ')}</small>}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
 }
 
-function ValidationStep(){
- const checks=[['Conexão com banco de origem','Oracle ERP','success'],['Conexão com banco de destino','PostgreSQL Analytics','success'],['Mapeamento de campos','42 mapeamentos validados','success'],['Regras de anonimização','12 regras configuradas','success'],['Campos que exigem revisão','2 avisos não bloqueantes','warning']]
- return <div className="wizard-section"><div className="wizard-title"><span className="wizard-icon">✓</span><div><h2>Validação antes da migração</h2><p>Confira o resumo antes de executar a operação.</p></div></div><div className="validation-grid"><div className="summary-card"><h3>Resumo</h3><dl><div><dt>Origem</dt><dd>Oracle</dd></div><div><dt>Destino</dt><dd>PostgreSQL</dd></div><div><dt>Tabelas</dt><dd>18</dd></div><div><dt>Registros estimados</dt><dd>35.482</dd></div><div><dt>Campos anonimizados</dt><dd>12</dd></div><div><dt>Mapeamentos IA</dt><dd>42</dd></div></dl></div><div className="check-list">{checks.map(c=><div key={c[0]}><span className={c[2]==='success'?'check-success':'check-warning'}>{c[2]==='success'?'✓':'!'}</span><div><strong>{c[0]}</strong><small>{c[1]}</small></div></div>)}</div></div><div className="warning-box"><strong>⚠ Operação demonstrativa</strong><p>Este front-end simula a validação. Em uma aplicação real, a checagem deve ser feita no backend antes do início da migração.</p></div></div>
+function ProposalStep({ conflicts }) {
+  return (
+    <div className="wizard-section">
+      <Title icon="⇄" title="Proposta de mapeamento" subtitle="Todas as colunas, com quem decidiu cada uma." />
+      <div className="table-wrap">
+        <table>
+          <thead><tr><th>Coluna</th><th>Origem</th><th>Destino</th><th>Quem</th><th>Resolução</th></tr></thead>
+          <tbody>
+            {conflicts.map((c) => {
+              const [label, tone] = c.status === 'DEFERRED' ? ['Pendente', 'danger'] : WHO[c.decidedBy] ?? ['—', 'neutral']
+              return (
+                <tr key={c.id}>
+                  <td><strong>{c.id}</strong></td>
+                  <td>{c.sourceType}</td>
+                  <td>{c.targetType}</td>
+                  <td><StatusBadge tone={tone}>{label}</StatusBadge></td>
+                  <td>{c.resolution ?? c.deferReason}</td>
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
 }
 
-function ExecutionStep({ progress, running, setRunning, stageStatus }){
- const tables=[['CLIENTES',20],['PEDIDOS',45],['PRODUTOS',70],['ENDERECOS',90],['PAGAMENTOS',100]]
- const done = progress >= 100
- return <div className="wizard-section"><div className="wizard-title"><span className="wizard-icon">⇄</span><div><h2>{done?'Migração concluída':'Migração em andamento'}</h2><p>{done?'Os dados foram processados com sucesso.':'Acompanhe a execução e os logs em tempo real.'}</p></div></div>{done && <div className="success-hero"><div className="success-hero__icon">✓</div><div><h3>Migração concluída!</h3><p>35.482 registros migrados · 18 tabelas · 12 campos anonimizados</p></div><button className="btn btn--secondary">Baixar relatório</button></div>}<div className="execution-grid"><div><div className="progress-header"><span>{Math.round(35482*progress/100).toLocaleString('pt-BR')} / 35.482 registros</span><strong>{progress}%</strong></div><div className="progress progress--large"><span style={{width:`${progress}%`}}/></div><div className="execution-list">{tables.map(([name,limit])=>{const status=progress>=limit?'Concluído':stageStatus[0]===name?'Executando':'Aguardando';return <div key={name}><strong>{name}</strong><StatusBadge tone={status==='Concluído'?'success':status==='Executando'?'info':'neutral'}>{status}</StatusBadge></div>})}</div>{!running && progress < 100 && <button className="btn btn--primary" onClick={()=>setRunning(true)}>{progress>0?'Retomar simulação':'Executar simulação'}</button>}</div><div className="console"><div className="console__header"><span/><span/><span/><strong>Logs em tempo real</strong></div><pre>{`18:55:01  Conectando ao Oracle...\n18:55:02  Conexão estabelecida\n18:55:04  Lendo tabela CLIENTES\n18:55:08  Aplicando anonimização\n18:55:13  Inserindo dados no PostgreSQL\n${progress>20?'18:55:19  CLIENTES concluída\n':''}${progress>45?'18:55:26  PEDIDOS concluída\n':''}${progress>70?'18:55:31  PRODUTOS concluída\n':''}${progress>90?'18:55:38  ENDERECOS concluída\n':''}${done?'18:55:44  MIGRAÇÃO CONCLUÍDA':''}`}</pre></div></div></div>
+function ApprovalStep({ deferred, decisions, setDecisions }) {
+  return (
+    <div className="wizard-section">
+      <Title icon="✓" title="Homologação" subtitle="A IA não resolve sozinha o que é ambíguo: cada DEFER precisa de uma decisão humana." />
+      {deferred.length === 0 && <div className="notice notice--success">Nenhum conflito pendente: a proposta pode ser aprovada.</div>}
+      {deferred.map((c) => (
+        <div className="form-card decision-card" key={c.id}>
+          <strong>{c.id}</strong> <small>{c.sourceType} → {c.targetType}</small>
+          <p>{c.deferReason}</p>
+          <label>
+            Decisão do DBA
+            <textarea rows={2} value={decisions[c.id] ?? ''} onChange={(e) => setDecisions({ ...decisions, [c.id]: e.target.value })} />
+          </label>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function EventList({ events }) {
+  return (
+    <ul className="event-list">
+      {events.map((e, i) => (
+        <li key={i}>
+          <code>{new Date(e.createdAt).toLocaleTimeString()}</code> <strong>{e.type}</strong>
+          {e.toStatus && <span> → {e.toStatus}</span>}
+        </li>
+      ))}
+    </ul>
+  )
+}
+
+function ExecutionStep({ migration, events }) {
+  return (
+    <div className="wizard-section">
+      <Title icon="⇄" title="Execução" subtitle={STATUS_TEXT[migration?.status] ?? ''} />
+      <div className="notice notice--info">⏳ {STATUS_TEXT[migration?.status]}</div>
+      <EventList events={events} />
+    </div>
+  )
+}
+
+function ResultStep({ migration, events }) {
+  const r = migration.result ?? {}
+  const checks = r.validation?.checks ?? []
+  const script = r.apply?.script
+  const download = () => {
+    const url = URL.createObjectURL(new Blob([script], { type: 'text/plain' }))
+    const a = Object.assign(document.createElement('a'), { href: url, download: `migracao-${migration.id.slice(0, 8)}.sql` })
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+  return (
+    <div className="wizard-section">
+      <Title icon="✓" title="Resultado" subtitle={STATUS_TEXT[migration.status]} />
+      {migration.status === 'COMPLETED' && (
+        <div className="success-hero">
+          <div className="success-hero__icon">✓</div>
+          <div>
+            <h3>Plano validado no sandbox</h3>
+            <p>{r.sandbox?.tables?.map((t) => `${t.name}: ${t.rows} linhas`).join(' · ')} · fidelidade {r.sandbox?.fidelity}</p>
+          </div>
+          {script && <button className="btn btn--secondary" onClick={download}>Baixar script .sql</button>}
+        </div>
+      )}
+      {migration.status === 'FAILED' && <div className="notice notice--danger">✕ {migration.error}</div>}
+      {migration.status === 'REJECTED' && <div className="notice notice--info">Proposta rejeitada: nada foi executado.</div>}
+      {checks.length > 0 && (
+        <div className="summary-card">
+          <h3>Verificações no sandbox</h3>
+          <ul className="event-list">
+            {checks.map((c) => (
+              <li key={c.name}>
+                <StatusBadge tone={c.passed ? 'success' : 'danger'}>{c.passed ? 'OK' : 'FALHOU'}</StatusBadge> <strong>{c.name}</strong>
+                {c.detail && <small className="evidence">{c.detail}</small>}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {r.sandbox?.tables && (
+        <div className="summary-card">
+          <h3>Sandbox anonimizado ({r.sandbox.datasetId})</h3>
+          <ul className="event-list">
+            {r.sandbox.tables.map((t) => (
+              <li key={t.name}><strong>{t.name}</strong>: {t.rows} linhas · anonimizadas: {t.anonymizedColumns.join(', ') || 'nenhuma'}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {script && <pre className="script-box">{script}</pre>}
+      <h3>Trilha de auditoria</h3>
+      <EventList events={events} />
+    </div>
+  )
 }

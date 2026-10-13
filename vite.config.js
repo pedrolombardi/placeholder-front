@@ -5,5 +5,9 @@ export default defineConfig({
   plugins: [react()],
   server: {
     port: 5173,
+    // /api -> Backend Core (localhost:3000), como o nginx faz no container
+    proxy: {
+      '/api': { target: process.env.CORE_URL ?? 'http://localhost:3000', rewrite: (p) => p.replace(/^\/api/, '') },
+    },
   },
 })
