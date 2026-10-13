@@ -1,0 +1,5 @@
+import StatusBadge from '../components/StatusBadge'
+export default function Reports(){
+ const rows=[['CRM Migration','35.482','18','12','04:32','Concluído','success'],['Financeiro 2026','52.101','24','18','07:18','Concluído','success'],['Recursos Humanos','12.448','9','7','02:04','Falhou','danger']]
+ return <div className="page"><div className="page-heading"><div><span className="eyebrow">RELATÓRIOS</span><h1>Resultados das migrações</h1><p>Consulte métricas e exporte os resultados dos projetos.</p></div><button className="btn btn--secondary">Exportar CSV</button></div><section className="panel"><div className="table-wrap"><table><thead><tr><th>Projeto</th><th>Registros</th><th>Tabelas</th><th>Anonimizados</th><th>Tempo</th><th>Status</th><th></th></tr></thead><tbody>{rows.map(r=><tr key={r[0]}>{r.slice(0,5).map(c=><td key={c}>{c}</td>)}<td><StatusBadge tone={r[6]}>{r[5]}</StatusBadge></td><td><button className="text-button">Visualizar</button></td></tr>)}</tbody></table></div></section></div>
+}
