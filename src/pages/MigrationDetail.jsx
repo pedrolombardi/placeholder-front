@@ -86,7 +86,7 @@ export default function MigrationDetail() {
           ) : (
             <dl>
               {Object.entries(DECIDED_BY).map(([key, [label]]) => (
-                <div key={key}><dt>Decididos por {label.toLowerCase()}</dt><dd>{count(key)}</dd></div>
+                <div key={key}><dt>Decididos por {(label === 'IA' ? label : label.toLowerCase())}</dt><dd>{count(key)}</dd></div>
               ))}
               <div><dt>Aguardando decisão humana</dt><dd>{conflicts.filter((c) => c.status === 'DEFERRED').length}</dd></div>
             </dl>

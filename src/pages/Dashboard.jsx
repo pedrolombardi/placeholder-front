@@ -86,7 +86,7 @@ export default function Dashboard() {
               <div className="panel__header"><div><h2>Conflitos de tipo</h2><p>Quem decidiu cada conflito das propostas.</p></div></div>
               <div className="donut"><div className="donut__circle" style={{ background: conicGradient([...DECIDERS.map(([k, , color]) => [color, c.byDecidedBy[k]]), ['#dfe5ef', c.pendingHuman]]) }}><strong>{c.total}</strong><span>conflitos</span></div></div>
               <div className="legend-list">
-                {DECIDERS.map(([k, label, color]) => <span key={k}><i className="dot" style={{ background: color }} />{c.byDecidedBy[k]} por {label.toLowerCase()}</span>)}
+                {DECIDERS.map(([k, label, color]) => <span key={k}><i className="dot" style={{ background: color }} />{c.byDecidedBy[k]} por {(label === 'IA' ? label : label.toLowerCase())}</span>)}
                 <span><i className="dot dot--green" />{c.pendingHuman} aguardando decisão humana</span>
                 <span className="muted">{c.deferredByAi} deferidos pela IA para o DBA</span>
               </div>
