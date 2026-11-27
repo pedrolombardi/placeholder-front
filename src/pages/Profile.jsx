@@ -1,1 +1,27 @@
-export default function Profile(){return <div className="page"><div className="page-heading"><div><span className="eyebrow">PERFIL</span><h1>Minha conta</h1><p>Atualize seus dados pessoais e credenciais.</p></div></div><div className="profile-grid"><section className="panel profile-card"><div className="profile-avatar">MT</div><h2>Marcelo Tan</h2><p>Administrador</p><button className="btn btn--secondary">Alterar foto</button></section><section className="panel"><h2>Dados pessoais</h2><div className="grid-2"><label>Nome<input defaultValue="Marcelo"/></label><label>Sobrenome<input defaultValue="Tan"/></label></div><label>E-mail<input defaultValue="marcelo@email.com"/></label><label>Empresa<input defaultValue="Placeholder Lab"/></label><button className="btn btn--primary">Salvar alterações</button></section></div></div>}
+import { useAuth } from '../auth/AuthContext'
+import { initials, ROLE_LABEL, ROLE_PERMISSIONS } from '../labels'
+
+export default function Profile() {
+  const { user, isDba } = useAuth()
+  const permissions = ROLE_PERMISSIONS[user.role] ?? []
+  return (
+    <div className="page">
+      <div className="page-heading"><div><span className="eyebrow">PERFIL</span><h1>Minha conta</h1><p>Dados da sessão autenticada no Backend Core.</p></div></div>
+      <div className="profile-grid">
+        <section className="panel profile-card">
+          <div className="profile-avatar">{initials(user.username)}</div>
+          <h2>{user.username}</h2>
+          <p>Perfil {ROLE_LABEL[user.role] ?? user.role}</p>
+        </section>
+        <section className="panel">
+          <h2>O que este perfil pode fazer</h2>
+          <ul className="event-list">
+            {permissions.map((p) => <li key={p}>✓ {p}</li>)}
+          </ul>
+          {!isDba && <div className="notice notice--info">Homologação e execução de migrações são restritas ao perfil DBA.</div>}
+          <div className="notice notice--info">Os usuários são criados pelo administrador da plataforma. Alteração de senha ou de perfil é feita por ele.</div>
+        </section>
+      </div>
+    </div>
+  )
+}
