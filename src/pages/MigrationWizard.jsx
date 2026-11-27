@@ -1,94 +1,190 @@
-import { useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import Stepper from '../components/Stepper'
 import StatusBadge from '../components/StatusBadge'
-import { api, waitWhile } from '../api'
+import { AuditTrail, ConflictTable, downloadScript, SandboxSummary, ValidationChecks } from '../components/MigrationParts'
+import { api, isAbort, isMissingRoute, waitWhile } from '../api'
+import { useAuth } from '../auth/AuthContext'
+import { dbLabel, statusLabel, statusTone } from '../labels'
 
 /**
  * Fluxo real da plataforma, ligado ao Backend Core:
  * origem/destino -> analise (DB Layer classifica, IA decide PROPOSE/DEFER) ->
  * proposta -> homologacao humana -> execucao (sandbox anonimizado + validacao)
  * -> resultado (verificacoes + script de migracao).
+ *
+ * Cada passo retoma a migracao pelo status atual no Core, entao repetir um passo
+ * depois de um erro continua a mesma migracao em vez de criar outra.
+ * `?id=` abre uma migracao existente no passo correspondente ao seu status.
  */
 
-const WHO = { rule: ['Regra', 'neutral'], ai: ['IA', 'info'], human: ['Humano', 'warning'] }
 const STATUS_TEXT = {
   CREATED: 'Migração criada',
   ANALYZING: 'Analisando: DB Layer lê os catálogos e classifica; a IA julga os conflitos ambíguos',
   WAITING_APPROVAL: 'Aguardando homologação humana',
   APPROVED: 'Aprovada',
   EXECUTING: 'Gerando o sandbox: DB Layer extrai a amostra e o Data Layer anonimiza',
-  VALIDATING: 'Validando o plano no sandbox Oracle (5 verificações determinísticas)',
+  VALIDATING: 'Validando o plano no sandbox Oracle com verificações determinísticas',
   COMPLETED: 'Concluída: plano validado e script de migração gerado',
   REJECTED: 'Rejeitada na homologação',
   FAILED: 'Falhou',
 }
 const SUGGESTED = 'Converter para NULL e registrar no relatório (decisão do DBA)'
 
+const ANALYSIS_BUSY = ['CREATED', 'ANALYZING']
+const EXECUTION_BUSY = ['APPROVED', 'EXECUTING', 'VALIDATING']
+const TERMINAL = ['COMPLETED', 'REJECTED', 'FAILED']
+
+/** Banco de demonstração configurado no DB Layer: a origem do MVP. */
+const DEMO_SOURCE = { type: 'mysql', host: 'mysql', database: 'vendas' }
+// Cores sem GET /connections ainda exigem as credenciais da origem no corpo do POST /migrations.
+const LEGACY_SOURCE_CREDENTIALS = { user: 'readonly', password: 'readonly' }
+
+function stepFor(status) {
+  if (ANALYSIS_BUSY.includes(status)) return 2
+  if (status === 'WAITING_APPROVAL') return 3
+  if (EXECUTION_BUSY.includes(status)) return 6
+  return 7
+}
+
+const deferredOf = (m) => (m?.proposal?.conflicts ?? []).filter((c) => c.status === 'DEFERRED')
+const sourceDatabase = (connections) => connections.live?.source?.schema?.toLowerCase() ?? DEMO_SOURCE.database
+const ignoreConflict = (e) => {
+  // 409: outra aba ou outro usuário já fez a transição; o status é relido em seguida.
+  if (e.status !== 409) throw e
+}
+const issueText = (i) => (typeof i === 'string' ? i : i?.message ? `${i.path?.length ? `${i.path.join('.')}: ` : ''}${i.message}` : JSON.stringify(i))
+
 export default function MigrationWizard() {
-  const [step, setStep] = useState(1)
-  const [form, setForm] = useState({
-    name: 'Vendas MySQL → Oracle',
-    source: { type: 'mysql', host: 'mysql', database: 'vendas', user: 'readonly', password: 'readonly' },
-    target: { type: 'oracle' },
-  })
+  const { isDba } = useAuth()
+  const navigate = useNavigate()
+  const [params] = useSearchParams()
+  const resumeId = params.get('id')
+
+  const [step, setStep] = useState(resumeId ? 0 : 1)
+  const [name, setName] = useState('Vendas MySQL → Oracle')
+  const [connections, setConnections] = useState({ state: 'loading' })
   const [migration, setMigration] = useState(null)
   const [events, setEvents] = useState([])
   const [decisions, setDecisions] = useState({})
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState(null)
+  const controllerRef = useRef(null)
 
-  const conflicts = migration?.proposal?.conflicts ?? []
-  const deferred = conflicts.filter((c) => c.status === 'DEFERRED')
+  const signal = () => controllerRef.current?.signal
 
-  const track = async (m) => {
+  const track = useCallback((m) => {
     setMigration(m)
-    setEvents(await api.events(m.id).catch(() => []))
-  }
+    api.events(m.id, { signal: controllerRef.current?.signal }).then(setEvents).catch(() => {})
+  }, [])
 
-  const guard = (fn) => async () => {
+  const guard = useCallback(async (fn) => {
     setBusy(true)
     setError(null)
     try {
       await fn()
     } catch (e) {
-      setError(e.message)
+      if (!isAbort(e)) setError({ message: e.message, issues: e.issues })
     } finally {
       setBusy(false)
     }
+  }, [])
+
+  const enterApproval = (m) => {
+    setDecisions(Object.fromEntries(deferredOf(m).map((c) => [c.id, SUGGESTED])))
+    setStep(m.status === 'WAITING_APPROVAL' ? 3 : 7)
   }
 
-  const analyze = guard(async () => {
-    const created = await api.createMigration(form)
-    await api.analyze(created.id)
-    const m = await waitWhile(created.id, ['CREATED', 'ANALYZING'], track)
-    await track(m)
-    if (m.status === 'FAILED') throw new Error(m.error ?? 'Análise falhou')
-    setDecisions(Object.fromEntries(m.proposal.conflicts.filter((c) => c.status === 'DEFERRED').map((c) => [c.id, SUGGESTED])))
-    setStep(3)
-  })
+  const runAnalysis = (existingId) =>
+    guard(async () => {
+      let id = existingId
+      if (!id) {
+        const source = { ...DEMO_SOURCE, database: sourceDatabase(connections) }
+        if (connections.state === 'missing') Object.assign(source, LEGACY_SOURCE_CREDENTIALS)
+        const created = await api.createMigration({ name: name.trim(), source, target: { type: 'oracle' } })
+        id = created.id
+        track(created)
+      }
+      let m = await api.getMigration(id, { signal: signal() })
+      if (m.status === 'CREATED') await api.analyze(id).catch(ignoreConflict)
+      m = await waitWhile(id, ANALYSIS_BUSY, track, { signal: signal() })
+      track(m)
+      enterApproval(m)
+    })
 
-  const approveAndExecute = guard(async () => {
-    const list = deferred.map((c) => ({ conflictId: c.id, resolution: decisions[c.id]?.trim() || SUGGESTED }))
-    await api.approve(migration.id, list)
-    await api.execute(migration.id)
-    setStep(6)
-    const m = await waitWhile(migration.id, ['APPROVED', 'EXECUTING', 'VALIDATING'], track)
-    await track(m)
-    setStep(7)
-  })
+  const runExecution = (id, list) =>
+    guard(async () => {
+      let m = await api.getMigration(id, { signal: signal() })
+      if (m.status === 'WAITING_APPROVAL') {
+        await api.approve(id, list).catch(ignoreConflict)
+        m = await api.getMigration(id, { signal: signal() })
+      }
+      if (m.status === 'APPROVED') await api.execute(id).catch(ignoreConflict)
+      if (!TERMINAL.includes(m.status)) {
+        setStep(6)
+        m = await waitWhile(id, EXECUTION_BUSY, track, { signal: signal() })
+      }
+      track(m)
+      setStep(7)
+    })
 
-  const reject = guard(async () => {
-    const m = await api.reject(migration.id, 'Rejeitada no assistente')
-    await track(m)
-    setStep(7)
-  })
+  // Um AbortController por montagem: sair da página cancela a espera e as consultas.
+  useEffect(() => {
+    const controller = new AbortController()
+    controllerRef.current = controller
+    api
+      .connections({ signal: controller.signal })
+      .then((data) => setConnections({ state: 'ok', live: data.live }))
+      .catch((e) => !isAbort(e) && setConnections({ state: isMissingRoute(e) ? 'missing' : 'error' }))
+
+    if (resumeId) {
+      api
+        .getMigration(resumeId, { signal: controller.signal })
+        .then((m) => {
+          track(m)
+          setName(m.name)
+          const next = stepFor(m.status)
+          if (next === 3) enterApproval(m)
+          else setStep(next)
+          if (next === 2) runAnalysis(m.id)
+          if (next === 6) runExecution(m.id, [])
+        })
+        .catch((e) => {
+          if (isAbort(e)) return
+          setError({ message: e.message })
+          setStep(1)
+        })
+    }
+    return () => {
+      controller.abort()
+      controllerRef.current?.abort()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [resumeId])
+
+  const deferred = deferredOf(migration)
+  const decisionList = () => deferred.map((c) => ({ conflictId: c.id, resolution: decisions[c.id]?.trim() || SUGGESTED }))
+  const analyze = () => runAnalysis(migration?.id)
+  const approveAndExecute = () => runExecution(migration.id, decisionList())
+  const reject = () =>
+    guard(async () => {
+      const m = await api.reject(migration.id, 'Rejeitada no assistente')
+      track(m)
+      setStep(7)
+    })
 
   const restart = () => {
+    controllerRef.current?.abort()
+    controllerRef.current = new AbortController()
     setStep(1)
     setMigration(null)
     setEvents([])
+    setDecisions({})
     setError(null)
+    if (resumeId) navigate('/app/migration/new', { replace: true })
   }
+
+  const backDisabled = busy || step <= 1 || step === 3 || step >= 5 || (step === 2 && Boolean(migration))
 
   return (
     <div className="page migration-page">
@@ -96,37 +192,51 @@ export default function MigrationWizard() {
         <div>
           <span className="eyebrow">NOVA MIGRAÇÃO</span>
           <h1>Assistente de migração</h1>
-          <p>Origem e destino reais: o código resolve o mecânico, a IA julga o ambíguo e você homologa.</p>
+          <p>Origem e destino reais: o código resolve o mecânico, a IA julga o ambíguo e o DBA homologa.</p>
         </div>
-        <StatusBadge tone={migration ? 'info' : 'neutral'}>{migration ? migration.status : 'Rascunho'}</StatusBadge>
+        <StatusBadge tone={migration ? statusTone(migration.status) : 'neutral'}>{migration ? statusLabel(migration.status) : 'Rascunho'}</StatusBadge>
       </div>
       <section className="panel migration-shell">
-        <Stepper current={step} />
+        <Stepper current={Math.max(step, 1)} />
         <div className="migration-body">
-          {error && <div className="notice notice--danger">✕ {error}</div>}
-          {step === 1 && <SourceStep form={form} setForm={setForm} />}
-          {step === 2 && <TargetStep form={form} setForm={setForm} busy={busy} />}
+          {error && (
+            <div className="notice notice--danger" role="alert">
+              ✕ {error.message}
+              {error.issues?.length > 0 && <ul>{error.issues.map((i) => <li key={issueText(i)}>{issueText(i)}</li>)}</ul>}
+            </div>
+          )}
+          {step === 0 && <div className="notice notice--info">⏳ Carregando migração...</div>}
+          {step === 1 && <SourceStep name={name} setName={setName} connections={connections} />}
+          {step === 2 && <TargetStep busy={busy} migration={migration} />}
           {step === 3 && <AnalysisStep migration={migration} />}
-          {step === 4 && <ProposalStep conflicts={conflicts} />}
-          {step === 5 && <ApprovalStep deferred={deferred} decisions={decisions} setDecisions={setDecisions} />}
+          {step === 4 && <ProposalStep conflicts={migration.proposal?.conflicts ?? []} />}
+          {step === 5 && <ApprovalStep deferred={deferred} decisions={decisions} setDecisions={setDecisions} canApprove={isDba} migration={migration} />}
           {step === 6 && <ExecutionStep migration={migration} events={events} />}
-          {step === 7 && <ResultStep migration={migration} events={events} />}
+          {step === 7 && <ResultStep migration={migration} events={events} onError={(e) => setError({ message: e.message })} />}
         </div>
         <div className="wizard-footer">
-          <button className="btn btn--secondary" onClick={() => setStep((s) => s - 1)} disabled={busy || step === 1 || step >= 5 || step === 3}>
+          <button className="btn btn--secondary" onClick={() => setStep((s) => s - 1)} disabled={backDisabled}>
             ← Voltar
           </button>
-          {step === 1 && <button className="btn btn--primary" onClick={() => setStep(2)}>Continuar →</button>}
-          {step === 2 && <button className="btn btn--primary" onClick={analyze} disabled={busy}>{busy ? 'Analisando...' : 'Analisar migração →'}</button>}
+          {step === 1 && <button className="btn btn--primary" onClick={() => setStep(2)} disabled={!name.trim()}>Continuar →</button>}
+          {step === 2 && <button className="btn btn--primary" onClick={analyze} disabled={busy}>{busy ? 'Analisando...' : migration ? 'Tentar análise novamente →' : 'Analisar migração →'}</button>}
           {(step === 3 || step === 4) && <button className="btn btn--primary" onClick={() => setStep(step + 1)}>Continuar →</button>}
-          {step === 5 && (
+          {step === 5 && isDba && (
             <span>
               <button className="btn btn--secondary" onClick={reject} disabled={busy}>Rejeitar</button>{' '}
               <button className="btn btn--primary" onClick={approveAndExecute} disabled={busy}>{busy ? 'Executando...' : 'Aprovar e executar →'}</button>
             </span>
           )}
-          {step === 6 && <button className="btn btn--primary" disabled>Executando...</button>}
-          {step === 7 && <button className="btn btn--primary" onClick={restart}>Nova migração</button>}
+          {step === 5 && !isDba && <Link className="btn btn--primary" to={`/app/migrations/${migration.id}`}>Ver migração</Link>}
+          {step === 6 && (busy || !error
+            ? <button className="btn btn--primary" disabled>Executando...</button>
+            : <button className="btn btn--primary" onClick={() => runExecution(migration.id, [])}>Continuar acompanhando</button>)}
+          {step === 7 && (
+            <span>
+              <Link className="btn btn--secondary" to={`/app/migrations/${migration.id}`}>Ver detalhes</Link>{' '}
+              <button className="btn btn--primary" onClick={restart}>Nova migração</button>
+            </span>
+          )}
         </div>
       </section>
     </div>
@@ -145,41 +255,53 @@ function Title({ icon, title, subtitle }) {
   )
 }
 
-function SourceStep({ form, setForm }) {
-  // MVP: a origem e a configurada no DB Layer (banco de demonstracao). Os campos
-  // ficam fixos para o usuario nao digitar um banco que sera recusado.
+function LiveSource({ connections }) {
+  if (connections.state === 'loading') return <div className="notice notice--info">⏳ Consultando a origem no DB Layer...</div>
+  const live = connections.live?.source
+  if (connections.state === 'ok' && live) {
+    return (
+      <div className={`notice ${live.connected ? 'notice--success' : 'notice--danger'}`}>
+        {live.connected ? '✓ Origem conectada' : '✕ Origem indisponível'}: {dbLabel(live.engine)} {live.version} · schema <strong>{live.schema}</strong>
+        {live.readOnly ? ' · somente leitura' : ''}{live.latencyMs != null ? ` · ${live.latencyMs} ms` : ''}
+      </div>
+    )
+  }
+  return (
+    <div className="notice notice--info">
+      A origem é o banco de demonstração configurado no DB Layer (MySQL <strong>{DEMO_SOURCE.database}</strong>, usuário somente leitura),
+      com as cargas de conflito reais. As credenciais ficam no DB Layer, não nesta tela.
+    </div>
+  )
+}
+
+function SourceStep({ name, setName, connections }) {
   const locked = { readOnly: true, className: 'input--locked' }
   return (
     <div className="wizard-section">
       <Title icon="⌁" title="Banco de origem" subtitle="Somente leitura: a origem nunca é alterada." />
       <div className="form-card">
-        <label>Nome da migração<input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></label>
+        <label>Nome da migração<input value={name} onChange={(e) => setName(e.target.value)} /></label>
         <div className="grid-3">
-          <label>Tipo de banco<select value={form.source.type} disabled><option value="mysql">MySQL</option></select></label>
-          <label>Host<input value={form.source.host} {...locked} /></label>
-          <label>Database<input value={form.source.database} {...locked} /></label>
+          <label>Tipo de banco<select value="mysql" disabled><option value="mysql">MySQL</option></select></label>
+          <label>Host<input value={DEMO_SOURCE.host} {...locked} /></label>
+          <label>Database<input value={sourceDatabase(connections)} {...locked} /></label>
         </div>
-        <div className="grid-2">
-          <label>Usuário (somente leitura)<input value={form.source.user} {...locked} /></label>
-          <label>Senha<input type="password" value={form.source.password} {...locked} /></label>
-        </div>
-        <div className="notice notice--info">
-          MVP: a origem é o banco de demonstração configurado no DB Layer (MySQL <strong>vendas</strong>, usuário somente leitura),
-          com as cargas de conflito reais. Conectar em outro banco pela tela fica para a Fase 7.
-        </div>
+        <LiveSource connections={connections} />
       </div>
     </div>
   )
 }
 
-function TargetStep({ form, setForm, busy }) {
+function TargetStep({ busy, migration }) {
   return (
     <div className="wizard-section">
       <Title icon="⌁" title="Banco de destino" subtitle="Oracle Database 23ai. Nada é escrito no destino sem homologação." />
       <div className="form-card">
-        <label>Tipo de banco<select value={form.target.type} onChange={(e) => setForm({ ...form, target: { type: e.target.value } })}><option value="oracle">Oracle</option></select></label>
+        <label>Tipo de banco<select value="oracle" disabled><option value="oracle">Oracle</option></select></label>
         <div className="notice notice--info">
-          {busy ? STATUS_TEXT.ANALYZING : 'Ao analisar, o DB Layer testa as conexões, lê os dois catálogos e classifica cada coluna; os conflitos de julgamento vão para a IA.'}
+          {busy
+            ? STATUS_TEXT[migration?.status === 'CREATED' ? 'CREATED' : 'ANALYZING']
+            : 'Ao analisar, o DB Layer testa as conexões, lê os dois catálogos e classifica cada coluna; os conflitos de julgamento vão para a IA.'}
         </div>
       </div>
     </div>
@@ -204,13 +326,13 @@ function AnalysisStep({ migration }) {
       <h3>Conflitos de julgamento</h3>
       <div className="table-wrap">
         <table>
-          <thead><tr><th>Coluna</th><th>Origem → destino</th><th>Decisão</th><th>Proposta / motivo</th></tr></thead>
+          <thead><tr><th>Coluna</th><th>Origem → destino</th><th>Decisão da IA</th><th>Proposta / motivo</th></tr></thead>
           <tbody>
             {judgement.map((c) => (
               <tr key={c.id}>
                 <td><strong>{c.id}</strong></td>
                 <td>{c.sourceType} → {c.targetType}</td>
-                <td>{c.status === 'DEFERRED' ? <StatusBadge tone="danger">DEFER</StatusBadge> : <StatusBadge tone="info">PROPOSE</StatusBadge>}</td>
+                <td>{c.status === 'DEFERRED' ? <StatusBadge tone="danger">Deferido ao DBA</StatusBadge> : <StatusBadge tone="info">Proposta</StatusBadge>}</td>
                 <td>
                   {c.resolution ?? c.deferReason}
                   {c.evidence?.length > 0 && <small className="evidence">Evidência: {c.evidence.join(' · ')}</small>}
@@ -228,33 +350,21 @@ function ProposalStep({ conflicts }) {
   return (
     <div className="wizard-section">
       <Title icon="⇄" title="Proposta de mapeamento" subtitle="Todas as colunas, com quem decidiu cada uma." />
-      <div className="table-wrap">
-        <table>
-          <thead><tr><th>Coluna</th><th>Origem</th><th>Destino</th><th>Quem</th><th>Resolução</th></tr></thead>
-          <tbody>
-            {conflicts.map((c) => {
-              const [label, tone] = c.status === 'DEFERRED' ? ['Pendente', 'danger'] : WHO[c.decidedBy] ?? ['—', 'neutral']
-              return (
-                <tr key={c.id}>
-                  <td><strong>{c.id}</strong></td>
-                  <td>{c.sourceType}</td>
-                  <td>{c.targetType}</td>
-                  <td><StatusBadge tone={tone}>{label}</StatusBadge></td>
-                  <td>{c.resolution ?? c.deferReason}</td>
-                </tr>
-              )
-            })}
-          </tbody>
-        </table>
-      </div>
+      <ConflictTable conflicts={conflicts} />
     </div>
   )
 }
 
-function ApprovalStep({ deferred, decisions, setDecisions }) {
+function ApprovalStep({ deferred, decisions, setDecisions, canApprove, migration }) {
   return (
     <div className="wizard-section">
-      <Title icon="✓" title="Homologação" subtitle="A IA não resolve sozinha o que é ambíguo: cada DEFER precisa de uma decisão humana." />
+      <Title icon="✓" title="Homologação" subtitle="A IA não resolve sozinha o que é ambíguo: cada conflito deferido precisa de uma decisão humana." />
+      {!canApprove && (
+        <div className="notice notice--info" data-testid="role-restricted">
+          Homologação e execução são restritas ao perfil DBA. A migração <strong>{migration.name}</strong> fica aguardando homologação;
+          um DBA pode concluí-la pela página da migração.
+        </div>
+      )}
       {deferred.length === 0 && <div className="notice notice--success">Nenhum conflito pendente: a proposta pode ser aprovada.</div>}
       {deferred.map((c) => (
         <div className="form-card decision-card" key={c.id}>
@@ -262,24 +372,11 @@ function ApprovalStep({ deferred, decisions, setDecisions }) {
           <p>{c.deferReason}</p>
           <label>
             Decisão do DBA
-            <textarea rows={2} value={decisions[c.id] ?? ''} onChange={(e) => setDecisions({ ...decisions, [c.id]: e.target.value })} />
+            <textarea rows={2} name={`decision-${c.id}`} disabled={!canApprove} value={decisions[c.id] ?? ''} onChange={(e) => setDecisions({ ...decisions, [c.id]: e.target.value })} />
           </label>
         </div>
       ))}
     </div>
-  )
-}
-
-function EventList({ events }) {
-  return (
-    <ul className="event-list">
-      {events.map((e, i) => (
-        <li key={i}>
-          <code>{new Date(e.createdAt).toLocaleTimeString()}</code> <strong>{e.type}</strong>
-          {e.toStatus && <span> → {e.toStatus}</span>}
-        </li>
-      ))}
-    </ul>
   )
 }
 
@@ -288,21 +385,14 @@ function ExecutionStep({ migration, events }) {
     <div className="wizard-section">
       <Title icon="⇄" title="Execução" subtitle={STATUS_TEXT[migration?.status] ?? ''} />
       <div className="notice notice--info">⏳ {STATUS_TEXT[migration?.status]}</div>
-      <EventList events={events} />
+      <AuditTrail events={events} />
     </div>
   )
 }
 
-function ResultStep({ migration, events }) {
+function ResultStep({ migration, events, onError }) {
   const r = migration.result ?? {}
-  const checks = r.validation?.checks ?? []
   const script = r.apply?.script
-  const download = () => {
-    const url = URL.createObjectURL(new Blob([script], { type: 'text/plain' }))
-    const a = Object.assign(document.createElement('a'), { href: url, download: `migracao-${migration.id.slice(0, 8)}.sql` })
-    a.click()
-    URL.revokeObjectURL(url)
-  }
   return (
     <div className="wizard-section">
       <Title icon="✓" title="Resultado" subtitle={STATUS_TEXT[migration.status]} />
@@ -313,37 +403,16 @@ function ResultStep({ migration, events }) {
             <h3>Plano validado no sandbox</h3>
             <p>{r.sandbox?.tables?.map((t) => `${t.name}: ${t.rows} linhas`).join(' · ')} · fidelidade {r.sandbox?.fidelity}</p>
           </div>
-          {script && <button className="btn btn--secondary" onClick={download}>Baixar script .sql</button>}
+          {script && <button className="btn btn--secondary" onClick={() => downloadScript(migration).catch(onError)}>Baixar script .sql</button>}
         </div>
       )}
       {migration.status === 'FAILED' && <div className="notice notice--danger">✕ {migration.error}</div>}
       {migration.status === 'REJECTED' && <div className="notice notice--info">Proposta rejeitada: nada foi executado.</div>}
-      {checks.length > 0 && (
-        <div className="summary-card">
-          <h3>Verificações no sandbox</h3>
-          <ul className="event-list">
-            {checks.map((c) => (
-              <li key={c.name}>
-                <StatusBadge tone={c.passed ? 'success' : 'danger'}>{c.passed ? 'OK' : 'FALHOU'}</StatusBadge> <strong>{c.name}</strong>
-                {c.detail && <small className="evidence">{c.detail}</small>}
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
-      {r.sandbox?.tables && (
-        <div className="summary-card">
-          <h3>Sandbox anonimizado ({r.sandbox.datasetId})</h3>
-          <ul className="event-list">
-            {r.sandbox.tables.map((t) => (
-              <li key={t.name}><strong>{t.name}</strong>: {t.rows} linhas · anonimizadas: {t.anonymizedColumns.join(', ') || 'nenhuma'}</li>
-            ))}
-          </ul>
-        </div>
-      )}
+      <ValidationChecks checks={r.validation?.checks} />
+      <SandboxSummary sandbox={r.sandbox} />
       {script && <pre className="script-box">{script}</pre>}
       <h3>Trilha de auditoria</h3>
-      <EventList events={events} />
+      <AuditTrail events={events} />
     </div>
   )
 }
