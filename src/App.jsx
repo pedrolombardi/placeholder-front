@@ -4,6 +4,7 @@ import Login from './pages/Login'
 import Dashboard from './pages/Dashboard'
 import Projects from './pages/Projects'
 import MigrationWizard from './pages/MigrationWizard'
+import MigrationDetail from './pages/MigrationDetail'
 import Reports from './pages/Reports'
 import Audit from './pages/Audit'
 import Connections from './pages/Connections'
@@ -23,6 +24,7 @@ export default function App() {
         <Route path="dashboard" element={<Dashboard />} />
         <Route path="projects" element={<Projects />} />
         <Route path="migration/new" element={<MigrationWizard />} />
+        <Route path="migrations/:id" element={<MigrationDetail />} />
         <Route path="reports" element={<Reports />} />
         <Route path="audit" element={<Audit />} />
         <Route path="connections" element={<Connections />} />

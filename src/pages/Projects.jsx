@@ -1,20 +1,10 @@
 import { useEffect, useState } from 'react'
-import { Link } from 'react-router-dom'
+import { Link, useSearchParams } from 'react-router-dom'
 import StatusBadge from '../components/StatusBadge'
-import { api } from '../api'
+import { ErrorNotice, Loading } from '../components/Loading'
+import { api, isAbort } from '../api'
+import { dbLabel, formatDateTime, STATUS } from '../labels'
 
-// Migracoes reais do Backend Core, com o progresso derivado do status.
-const STAGE = {
-  CREATED: ['Criada', 'neutral', 5],
-  ANALYZING: ['Analisando', 'info', 20],
-  WAITING_APPROVAL: ['Aguardando homologação', 'warning', 45],
-  APPROVED: ['Aprovada', 'info', 55],
-  EXECUTING: ['Gerando sandbox', 'info', 70],
-  VALIDATING: ['Validando', 'info', 85],
-  COMPLETED: ['Concluída', 'success', 100],
-  REJECTED: ['Rejeitada', 'neutral', 100],
-  FAILED: ['Falhou', 'danger', 100],
-}
 const FILTERS = {
   Todos: () => true,
   'Em andamento': (s) => !['COMPLETED', 'REJECTED', 'FAILED'].includes(s),
@@ -26,12 +16,16 @@ export default function Projects() {
   const [migrations, setMigrations] = useState(null)
   const [error, setError] = useState(null)
   const [filter, setFilter] = useState('Todos')
+  const [params, setParams] = useSearchParams()
+  const query = (params.get('q') ?? '').trim().toLowerCase()
 
   useEffect(() => {
-    api.listMigrations().then(setMigrations).catch((e) => setError(e.message))
+    const controller = new AbortController()
+    api.listMigrations({ signal: controller.signal }).then(setMigrations).catch((e) => !isAbort(e) && setError(e.message))
+    return () => controller.abort()
   }, [])
 
-  const shown = (migrations ?? []).filter((m) => FILTERS[filter](m.status))
+  const shown = (migrations ?? []).filter((m) => FILTERS[filter](m.status) && (!query || m.name.toLowerCase().includes(query)))
 
   return (
     <div className="page">
@@ -48,24 +42,31 @@ export default function Projects() {
           <button key={f} className={f === filter ? 'active' : ''} onClick={() => setFilter(f)}>{f}</button>
         ))}
       </div>
-      {error && <div className="notice notice--danger">✕ Backend Core indisponível: {error}</div>}
-      {migrations && shown.length === 0 && <div className="notice notice--info">Nenhuma migração aqui ainda.</div>}
+      {query && (
+        <div className="notice notice--info">
+          Busca: <strong>{params.get('q')}</strong> · {shown.length} resultado(s){' '}
+          <button className="text-button" onClick={() => setParams({})}>Limpar busca</button>
+        </div>
+      )}
+      <ErrorNotice error={error && `Backend Core indisponível: ${error}`} />
+      {!migrations && !error && <Loading>Carregando migrações...</Loading>}
+      {migrations && shown.length === 0 && <div className="notice notice--info">Nenhuma migração encontrada.</div>}
       <div className="project-grid">
         {shown.map((m) => {
-          const [label, tone, progress] = STAGE[m.status] ?? [m.status, 'neutral', 0]
+          const [label, tone, progress] = STATUS[m.status] ?? [m.status, 'neutral', 0]
           return (
-            <article className="project-card" key={m.id}>
+            <Link className="project-card" key={m.id} to={`/app/migrations/${m.id}`}>
               <div className="project-card__top">
                 <div className="project-icon">▦</div>
                 <StatusBadge tone={tone}>{label}</StatusBadge>
               </div>
               <h3>{m.name}</h3>
-              <p>{m.source?.type} <span>→</span> {m.target?.type}</p>
+              <p>{dbLabel(m.source?.type)} <span>→</span> {dbLabel(m.target?.type)}</p>
               <div className="progress"><span style={{ width: `${progress}%` }} /></div>
               <div className="project-card__footer">
-                <small>{m.proposal?.summary ?? m.error ?? new Date(m.createdAt).toLocaleString()}</small>
+                <small>{m.proposal?.summary ?? m.error ?? formatDateTime(m.createdAt)}</small>
               </div>
-            </article>
+            </Link>
           )
         })}
       </div>

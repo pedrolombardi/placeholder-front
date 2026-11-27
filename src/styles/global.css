@@ -51,3 +51,13 @@ button:disabled{cursor:not-allowed;opacity:.55}
 .event-list { list-style: none; padding: 0; margin: 8px 0; display: grid; gap: 6px; }
 .script-box { background: #0f172a; color: #e2e8f0; padding: 16px; border-radius: 10px; overflow-x: auto; font-size: 12px; line-height: 1.5; white-space: pre; }
 .input--locked { background: #f3f4f6; color: #6b7280; cursor: not-allowed; }
+
+/* ---- dados reais do Core: detalhe, relatórios, auditoria ---- */
+a.project-card { display: block; transition: .18s ease; }
+a.project-card:hover { border-color: var(--primary); transform: translateY(-1px); }
+.detail-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin-bottom: 16px; }
+.detail-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.muted { color: var(--muted); }
+@media (min-width: 721px) { .timeline__item { grid-template-columns: 20px 130px 1fr 120px; } }
+@media (max-width: 900px) { .detail-grid { grid-template-columns: 1fr; } }
+.stack > .panel { margin-bottom: 16px; }

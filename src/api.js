@@ -5,13 +5,14 @@ import { clearSession, readSession, SESSION_EXPIRED } from './auth/session'
 const BASE = import.meta.env.VITE_API_URL ?? '/api'
 
 export class ApiError extends Error {
-  constructor(status, message) {
+  constructor(status, message, issues) {
     super(message)
     this.status = status
+    this.issues = issues
   }
 }
 
-async function call(method, path, body, { signal, anonymous = false } = {}) {
+async function call(method, path, body, { signal, anonymous = false, text = false } = {}) {
   const headers = {}
   if (body) headers['content-type'] = 'application/json'
   const token = anonymous ? null : readSession()?.token
@@ -24,12 +25,13 @@ async function call(method, path, body, { signal, anonymous = false } = {}) {
     if (e.name === 'AbortError') throw e
     throw new ApiError(0, 'Backend Core indisponível')
   }
+  if (text && res.ok) return res.text()
   const data = await res.json().catch(() => ({}))
   if (res.status === 401 && !anonymous) {
     clearSession()
     window.dispatchEvent(new CustomEvent(SESSION_EXPIRED, { detail: data.error }))
   }
-  if (!res.ok) throw new ApiError(res.status, data.error ?? `HTTP ${res.status}`)
+  if (!res.ok) throw new ApiError(res.status, data.error ?? `HTTP ${res.status}`, data.issues)
   return data
 }
 
@@ -45,7 +47,16 @@ export const api = {
   approve: (id, decisions) => call('POST', `/migrations/${id}/approve`, { decisions }),
   reject: (id, reason) => call('POST', `/migrations/${id}/reject`, { reason }),
   execute: (id) => call('POST', `/migrations/${id}/execute`),
+  script: (id) => call('GET', `/migrations/${id}/script`, undefined, { text: true }),
+  connections: (opts) => call('GET', '/connections', undefined, opts),
+  createConnection: (input) => call('POST', '/connections', input),
+  deleteConnection: (id) => call('DELETE', `/connections/${id}`),
+  testConnection: (id) => call('POST', `/connections/${id}/test`),
+  settings: (opts) => call('GET', '/settings', undefined, opts),
 }
+
+/** Rota que não existe nesta versão do Core. */
+export const isMissingRoute = (e) => e?.status === 404
 
 function sleep(ms, signal) {
   return new Promise((resolve, reject) => {
