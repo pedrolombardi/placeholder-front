@@ -22,9 +22,6 @@ export default function Sidebar() {
           </NavLink>
         ))}
       </nav>
-      <div className="sidebar__footer">
-        <div className="sidebar__security">🛡️ <span>Ambiente protegido<br/><small>Criptografia ativa</small></span></div>
-      </div>
     </aside>
   )
 }
