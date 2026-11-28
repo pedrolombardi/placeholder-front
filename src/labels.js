@@ -37,6 +37,21 @@ export const dbLabel = (t) => DB_LABEL[t] ?? t ?? '—'
 
 export const DECIDED_BY = { rule: ['Regra', 'neutral'], ai: ['IA', 'info'], human: ['Humano', 'warning'] }
 
+/** estratégia de anonimização do Data Layer → rótulo */
+const STRATEGY_LABEL = {
+  redact: 'mascarado, mesmo tamanho',
+  pseudonymize_local_part: 'e-mail pseudonimizado',
+  preserve_prefix: 'prefixo preservado',
+  regenerate_document: 'documento regenerado',
+  resample_name: 'nome sorteado',
+  jitter: 'valor com ruído',
+  mint_key: 'nova chave, mantém as FKs',
+  mint_uuid: 'novo UUID',
+  mint_handle: 'novo identificador',
+  shuffle: 'embaralhado entre linhas',
+}
+export const strategyLabel = (s) => STRATEGY_LABEL[s] ?? s
+
 const EVENT_LABEL = {
   MIGRATION_CREATED: 'Migração criada',
   PROPOSAL_CREATED: 'Proposta gerada',

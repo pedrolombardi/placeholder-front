@@ -1,6 +1,6 @@
 import StatusBadge from './StatusBadge'
 import { api, isMissingRoute } from '../api'
-import { actorLabel, DECIDED_BY, eventLabel, formatDateTime, oneRowPerTransition, statusLabel } from '../labels'
+import { actorLabel, DECIDED_BY, eventLabel, formatDateTime, oneRowPerTransition, statusLabel, strategyLabel } from '../labels'
 
 /** Todas as colunas da proposta, com quem decidiu cada uma. */
 export function ConflictTable({ conflicts }) {
@@ -53,7 +53,7 @@ export function SandboxSummary({ sandbox }) {
       <p className="muted">Dataset {sandbox.datasetId} · fidelidade {sandbox.fidelity}{sandbox.verdict ? ` · veredito ${sandbox.verdict}` : ''}</p>
       <ul className="event-list">
         {sandbox.tables.map((t) => (
-          <li key={t.name}><strong>{t.name}</strong>: {t.rows} linhas · anonimizadas: {t.anonymizedColumns.join(', ') || 'nenhuma'}</li>
+          <li key={t.name}><strong>{t.name}</strong>: {t.rows} linhas · anonimizadas: {t.anonymizedColumns.map((c) => (t.strategies?.[c] ? `${c} (${strategyLabel(t.strategies[c])})` : c)).join(', ') || 'nenhuma'}</li>
         ))}
       </ul>
     </div>
